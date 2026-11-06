@@ -1,0 +1,58 @@
+name: Publish Windows preview
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        default: v0.1.0
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m unittest discover -s tests -v
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-Engine.ps1
+      - run: ./build.ps1
+      - name: Verify packaged application
+        shell: pwsh
+        run: |
+          $p=Start-Process -FilePath dist/CodexDriveMigrator.exe -ArgumentList '--self-test self-test-result.json' -Wait -PassThru
+          if($p.ExitCode -ne 0){throw 'Packaged self-test failed'}
+          if(-not (Get-Content self-test-result.json -Raw|ConvertFrom-Json).passed){throw 'Verification failed'}
+          $p=Start-Process -FilePath dist/CodexDriveMigrator.exe -ArgumentList '--ui-smoke-test' -Wait -PassThru
+          if($p.ExitCode -ne 0){throw 'GUI startup failed'}
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-Engine.ps1 -PythonExe "$PWD\dist\CodexDriveMigrator.exe" -FrozenHelper
+          if($LASTEXITCODE -ne 0){throw 'Packaged engine test failed'}
+      - name: Prepare versioned source archive and checksums
+        shell: pwsh
+        run: |
+          git archive --format=zip --prefix=codex-drive-migrator/ --output=dist/codex-drive-migrator-source.zip HEAD
+          if($LASTEXITCODE -ne 0){throw 'Source archive failed'}
+          $lines=foreach($name in @('CodexDriveMigrator.exe','codex-drive-migrator-source.zip')){
+            (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+$name
+          }
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt",($lines -join "`n")+"`n",(New-Object Text.UTF8Encoding($false)))
+      - name: Publish tested release files
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY"
+          if($LASTEXITCODE -ne 0){
+            gh release create "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --prerelease --title "$env:RELEASE_TAG Windows Preview" --notes-file RELEASE_NOTES.md
+            if($LASTEXITCODE -ne 0){throw 'Release creation failed'}
+          }
+          gh release upload "$env:RELEASE_TAG" dist/CodexDriveMigrator.exe dist/SHA256SUMS.txt dist/codex-drive-migrator-source.zip --repo "$env:GITHUB_REPOSITORY" --clobber
+          if($LASTEXITCODE -ne 0){throw 'Release upload failed'}
